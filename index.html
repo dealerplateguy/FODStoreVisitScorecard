@@ -255,9 +255,36 @@ let S={
 function userStores(){return S.currentUser?S.currentUser.stores||ALL_STORES:ALL_STORES;}
 function draftKey(){return S.currentUser?"scorecard-draft-"+S.currentUser.name:null;}
 
-function compress(file,cb){const r=new FileReader();r.onload=e=>{const img=new Image();img.onload=()=>{const c=document.createElement("canvas");let w=img.width,h=img.height;if(w>800){h=800/w*h;w=800;}c.width=w;c.height=h;c.getContext("2d").drawImage(img,0,0,w,h);cb(c.toDataURL("image/jpeg",0.6));};img.src=e.target.result;};r.readAsDataURL(file);}
+function compressToBlob(file){
+  return new Promise((resolve)=>{
+    const r=new FileReader();r.onload=e=>{
+      const img=new Image();img.onload=()=>{
+        const c=document.createElement("canvas");let w=img.width,h=img.height;
+        if(w>1200){h=1200/w*h;w=1200;}c.width=w;c.height=h;
+        c.getContext("2d").drawImage(img,0,0,w,h);
+        c.toBlob(blob=>resolve(blob),"image/jpeg",0.7);
+      };img.src=e.target.result;
+    };r.readAsDataURL(file);
+  });
+}
 
-function saveDraft(){const dk=draftKey();if(!dk)return;if(S.store||Object.keys(S.scores).length>0)localStorage.setItem(dk,JSON.stringify({scores:S.scores,comments:S.comments,photos:S.photos,notes:S.notes,store:S.store}));}
+async function uploadPhoto(file){
+  const blob=await compressToBlob(file);
+  const fname=Date.now()+"_"+Math.random().toString(36).slice(2,8)+".jpg";
+  const res=await fetch(SB_URL+"/storage/v1/object/scorecard-photos/"+fname,{
+    method:"POST",
+    headers:{apikey:SB_KEY,Authorization:"Bearer "+SB_KEY,"Content-Type":"image/jpeg"},
+    body:blob
+  });
+  if(!res.ok){const err=await res.text();throw new Error("Upload failed: "+err);}
+  // Return public URL
+  return SB_URL+"/storage/v1/object/public/scorecard-photos/"+fname;
+}
+
+function saveDraft(){const dk=draftKey();if(!dk)return;if(S.store||Object.keys(S.scores).length>0){
+  // Photos are now URLs (small strings), safe to store in localStorage
+  localStorage.setItem(dk,JSON.stringify({scores:S.scores,comments:S.comments,photos:S.photos,notes:S.notes,store:S.store}));
+}}
 function loadDraft(){const dk=draftKey();if(!dk)return;try{const dr=JSON.parse(localStorage.getItem(dk));if(dr){S.scores=dr.scores||{};S.comments=dr.comments||{};S.photos=dr.photos||{};S.notes=dr.notes||"";if(dr.store){S.store=dr.store;S.storeConfirmed=true;}}}catch(e){}}
 function clearDraft(){S.scores={};S.comments={};S.photos={};S.notes="";S.store=null;S.storeConfirmed=false;const dk=draftKey();if(dk)localStorage.removeItem(dk);}
 
@@ -405,7 +432,27 @@ document.addEventListener("click",function(e){const m=document.getElementById("u
 function pickStore(s){S.store=s;S.storeConfirmed=true;saveDraft();render();}
 function changeStore(){S.storeConfirmed=false;render();}
 function doScore(ci,ii,v){const k=ci+"-"+ii;if(S.scores[k]===v){delete S.scores[k];delete S.comments[k];delete S.photos[k];}else{S.scores[k]=v;}saveDraft();render();}
-function addPhoto(key){const inp=document.createElement("input");inp.type="file";inp.accept="image/*";inp.capture="environment";inp.onchange=()=>{if(inp.files[0])compress(inp.files[0],url=>{if(!S.photos[key])S.photos[key]=[];if(S.photos[key].length<5)S.photos[key].push(url);saveDraft();render();});};inp.click();}
+function addPhoto(key){
+  const inp=document.createElement("input");inp.type="file";inp.accept="image/*";inp.capture="environment";
+  inp.onchange=async()=>{
+    if(!inp.files[0])return;
+    // Show uploading indicator
+    if(!S.photos[key])S.photos[key]=[];
+    const idx=S.photos[key].length;
+    S.photos[key].push("uploading");render();
+    try{
+      const url=await uploadPhoto(inp.files[0]);
+      S.photos[key][idx]=url;
+      saveDraft();render();
+    }catch(err){
+      console.error("Photo upload error:",err);
+      S.photos[key].splice(idx,1);
+      if(S.photos[key].length===0)delete S.photos[key];
+      S.error="Photo upload failed. Try again.";
+      render();
+    }
+  };inp.click();
+}
 function rmPhoto(key,idx){if(S.photos[key]){S.photos[key].splice(idx,1);if(S.photos[key].length===0)delete S.photos[key];}saveDraft();render();}
 
 // ─── Render ───
@@ -649,7 +696,7 @@ if(S.view==="score"){
           h+='<input type="text" class="comment-input '+cClass+'" placeholder="'+cPlaceholder+'" value="'+esc(S.comments[key]||'')+'" oninput="S.comments[\''+key+'\']=this.value;saveDraft()"/>';
           const ph=S.photos[key]||[];
           h+='<div class="photo-strip">';
-          ph.forEach((p,pi)=>{h+='<div class="photo-thumb-wrap"><img class="photo-thumb" src="'+p+'"/><button class="photo-remove" onclick="rmPhoto(\''+key+'\','+pi+')">×</button></div>';});
+          ph.forEach((p,pi)=>{if(p==="uploading"){h+='<div class="photo-thumb-wrap"><div style="width:60px;height:60px;border-radius:10px;border:1px solid #ddd;display:flex;align-items:center;justify-content:center;background:#f5f5f3;font-size:11px;color:#999">⏳</div></div>';}else{h+='<div class="photo-thumb-wrap"><img class="photo-thumb" src="'+p+'"/><button class="photo-remove" onclick="rmPhoto(\''+key+'\','+pi+')">×</button></div>';}});
           if(ph.length<5)h+='<button class="add-photo-btn" onclick="addPhoto(\''+key+'\')"><span>📷</span><span>Add</span></button>';
           h+='</div>';
         }
@@ -851,7 +898,12 @@ async function downloadPDF(){
     });
     if(pe.notes){chk(36);doc.setFontSize(11);doc.setFont('helvetica','bold');doc.setTextColor(30);doc.text('Visit Notes',m,y);y+=14;doc.setFont('helvetica','normal');doc.setFontSize(9);doc.setTextColor(100);const nl=doc.splitTextToSize(pe.notes,uw);nl.forEach(ln=>{chk(12);doc.text(ln,m,y);y+=12;});}
     const photosToAdd=[];pf.forEach(f=>{if(f.photos&&f.photos.length>0)f.photos.forEach(p=>photosToAdd.push({item:f.item,src:p}));});
-    if(photosToAdd.length>0){chk(30);y+=6;doc.setFontSize(11);doc.setFont('helvetica','bold');doc.setTextColor(30);doc.text('Photo Documentation',m,y);y+=16;for(const ph of photosToAdd){chk(120);doc.setFontSize(8);doc.setFont('helvetica','normal');doc.setTextColor(80);doc.text(ph.item,m,y);y+=10;try{doc.addImage(ph.src,'JPEG',m,y,140,105);y+=112;}catch(e){y+=4;}}}
+    if(photosToAdd.length>0){chk(30);y+=6;doc.setFontSize(11);doc.setFont('helvetica','bold');doc.setTextColor(30);doc.text('Photo Documentation',m,y);y+=16;for(const ph of photosToAdd){chk(120);doc.setFontSize(8);doc.setFont('helvetica','normal');doc.setTextColor(80);doc.text(ph.item,m,y);y+=10;try{
+      // Fetch image and convert to base64 for PDF
+      const imgRes=await fetch(ph.src);const imgBlob=await imgRes.blob();
+      const imgB64=await new Promise(r=>{const rd=new FileReader();rd.onload=()=>r(rd.result);rd.readAsDataURL(imgBlob);});
+      doc.addImage(imgB64,'JPEG',m,y,140,105);y+=112;
+    }catch(e){y+=4;}}}
     const fn=pe.store.replace(/\s+/g,'_')+'_Visit_'+new Date(pe.date).toISOString().slice(0,10)+'.pdf';
     doc.save(fn);
     if(btn){btn.textContent='✅ Downloaded!';setTimeout(()=>{btn.textContent='📄 Download PDF';btn.disabled=false;},3000);}
