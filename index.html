@@ -218,10 +218,11 @@ function esc(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace
 let S={
   // App mode
   mode:"loading", // loading | pick_user | add_user | app
-  addStep:"name", // name | stores | pin
+  addStep:"name", // name | stores | role | pin
   addName:"",
   addStores:[],
   addPin:"",
+  addRole:"admin",
   // Users
   users:[],
   currentUser:null, // {id, name, stores, can_see_all}
@@ -338,7 +339,7 @@ async function createUser(){
   if(!S.addName.trim()||S.addStores.length===0||S.addPin.length!==6)return;
   S.syncing=true;render();
   try{
-    const[user]=await sb("scorecard_users",{method:"POST",body:{name:S.addName.trim(),stores:S.addStores,can_see_all:false,pin:S.addPin}});
+    const[user]=await sb("scorecard_users",{method:"POST",body:{name:S.addName.trim(),stores:S.addStores,can_see_all:false,pin:S.addPin,role:S.addRole}});
     S.users.push(user);
     selectUser(user);
   }catch(err){console.error("Create user error:",err);S.error="Error creating user: "+err.message;S.syncing=false;render();}
@@ -364,7 +365,8 @@ function selectUser(u){
   S.currentUser=u;
   // Save 30-day session
   localStorage.setItem("scorecard-session",JSON.stringify({name:u.name,ts:Date.now()}));
-  S.view="score";S.store=null;S.storeConfirmed=false;
+  S.view=u.role==="viewer"?"history":"score";
+  S.store=null;S.storeConfirmed=false;
   S.scores={};S.comments={};S.photos={};S.notes="";
   S.history=[];S.expanded=null;S.histFilter="All";S.report=null;S.error=null;
   S.showChangePin=false;S.newPin="";
@@ -409,8 +411,11 @@ function rmPhoto(key,idx){if(S.photos[key]){S.photos[key].splice(idx,1);if(S.pho
 // ─── Render ───
 function renderTabs(){
   const t=document.getElementById("tabs");
-  const labels=["Score a visit","History","Dashboard"];
-  const keys=["score","history","dashboard"];
+  const isViewer=S.currentUser&&S.currentUser.role==="viewer";
+  const labels=isViewer?["History","Dashboard"]:["Score a visit","History","Dashboard"];
+  const keys=isViewer?["history","dashboard"]:["score","history","dashboard"];
+  // If viewer somehow lands on score view, redirect
+  if(isViewer&&S.view==="score")S.view="history";
   t.innerHTML=keys.map((k,i)=>'<button class="'+(S.view===k?"active":"")+'" onclick="S.view=\''+k+'\';render()">'+labels[i]+'</button>').join("");
 }
 
@@ -436,10 +441,10 @@ if(S.mode==="pick_user"){
   h+='<div class="picker-label">Who\'s scoring today?</div>';
   S.users.forEach(u=>{
     h+='<button class="picker-card" onclick="startLogin(S.users.find(x=>x.id==='+u.id+'))">';
-    h+='<div><div>'+esc(u.name)+'</div><div class="picker-card-sub">'+(u.stores?u.stores.length:0)+' store'+(u.stores&&u.stores.length!==1?'s':'')+(u.can_see_all?' · Full access':'')+'</div></div>';
+    h+='<div><div>'+esc(u.name)+'</div><div class="picker-card-sub">'+(u.stores?u.stores.length:0)+' store'+(u.stores&&u.stores.length!==1?'s':'')+(u.can_see_all?' · Full access':'')+(u.role==='viewer'?' · View only':'')+'</div></div>';
     h+='<span style="color:#ccc;font-size:14px">→</span></button>';
   });
-  h+='<button class="picker-add" onclick="S.mode=\'add_user\';S.addStep=\'name\';S.addName=\'\';S.addStores=[];S.addPin=\'\';render()"><span style="font-size:20px">+</span> Add new user</button>';
+  h+='<button class="picker-add" onclick="S.mode=\'add_user\';S.addStep=\'name\';S.addName=\'\';S.addStores=[];S.addPin=\'\';S.addRole=\'admin\';render()"><span style="font-size:20px">+</span> Add new user</button>';
   if(S.error)h+='<div style="text-align:center;font-size:12px;color:#A32D2D;margin-top:12px">'+esc(S.error)+'</div>';
   h+='</div></div>';
   app.innerHTML=h;
@@ -451,7 +456,7 @@ if(S.mode==="add_user"){
   tb.style.display="none";
   let h='<div class="picker-screen"><div class="picker-box">';
   h+='<div class="picker-title">New User Setup</div>';
-  h+='<div class="picker-sub">'+(S.addStep==="name"?"Step 1 of 3 — Enter your name":S.addStep==="stores"?"Step 2 of 3 — Select your stores":"Step 3 of 3 — Create your PIN")+'</div>';
+  h+='<div class="picker-sub">'+(S.addStep==="name"?"Step 1 of 4 — Enter your name":S.addStep==="stores"?"Step 2 of 4 — Select your stores":S.addStep==="role"?"Step 3 of 4 — Choose access level":"Step 4 of 4 — Create your PIN")+'</div>';
 
   if(S.addStep==="name"){
     h+='<input class="add-input" id="add-name-input" type="text" placeholder="Your full name" value="'+esc(S.addName)+'" oninput="S.addName=this.value"/>';
@@ -468,14 +473,22 @@ if(S.mode==="add_user"){
       h+=esc(s)+'<span style="font-size:18px">'+(on?"✓":"")+'</span></button>';
     });
     h+='<div style="height:12px"></div>';
-    h+='<button class="add-btn '+(S.addStores.length>0?'on':'off')+'" onclick="if(S.addStores.length>0){S.addStep=\'pin\';render();}">Continue ('+S.addStores.length+' store'+(S.addStores.length!==1?'s':'')+')</button>';
+    h+='<button class="add-btn '+(S.addStores.length>0?'on':'off')+'" onclick="if(S.addStores.length>0){S.addStep=\'role\';render();}">Continue ('+S.addStores.length+' store'+(S.addStores.length!==1?'s':'')+')</button>';
     h+='<button class="back-btn" onclick="S.addStep=\'name\';render()">← Back</button>';
+  } else if(S.addStep==="role"){
+    h+='<div style="font-size:14px;color:#555;margin-bottom:16px;text-align:center">What level of access should this user have?</div>';
+    const isAdmin=S.addRole==="admin",isViewer=S.addRole==="viewer";
+    h+='<button class="store-check '+(isAdmin?'on':'off')+'" onclick="S.addRole=\'admin\';render()" style="margin-bottom:8px"><div><div style="font-size:15px;font-weight:'+(isAdmin?'600':'400')+'">Full Access</div><div style="font-size:12px;color:#888;margin-top:2px">Can score visits, view history & dashboard</div></div><span style="font-size:18px">'+(isAdmin?"✓":"")+'</span></button>';
+    h+='<button class="store-check '+(isViewer?'on':'off')+'" onclick="S.addRole=\'viewer\';render()"><div><div style="font-size:15px;font-weight:'+(isViewer?'600':'400')+'">View Only</div><div style="font-size:12px;color:#888;margin-top:2px">Can view history & dashboard, cannot score visits</div></div><span style="font-size:18px">'+(isViewer?"✓":"")+'</span></button>';
+    h+='<div style="height:12px"></div>';
+    h+='<button class="add-btn on" onclick="S.addStep=\'pin\';render()">Continue</button>';
+    h+='<button class="back-btn" onclick="S.addStep=\'stores\';render()">← Back</button>';
   } else if(S.addStep==="pin"){
     h+='<div style="font-size:14px;color:#555;margin-bottom:16px;text-align:center">Create a 6-digit PIN to secure your account</div>';
     h+='<input class="add-input" id="add-pin-input" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="Enter 6-digit PIN" value="'+esc(S.addPin)+'" oninput="S.addPin=this.value.replace(/[^0-9]/g,\'\').slice(0,6);this.value=S.addPin;" style="text-align:center;font-size:24px;font-family:DM Mono,monospace;letter-spacing:8px"/>';
     const pinOk=S.addPin.length===6;
     h+='<button class="add-btn '+(pinOk?'on':'off')+'" onclick="createUser()">'+(S.syncing?'Creating account...':'Create account')+'</button>';
-    h+='<button class="back-btn" onclick="S.addStep=\'stores\';render()">← Back</button>';
+    h+='<button class="back-btn" onclick="S.addStep=\'role\';render()">← Back</button>';
   }
   if(S.error)h+='<div style="text-align:center;font-size:12px;color:#A32D2D;margin-top:12px">'+esc(S.error)+'</div>';
   h+='</div></div>';
