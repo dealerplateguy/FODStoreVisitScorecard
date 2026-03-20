@@ -164,7 +164,13 @@ input,textarea{font-family:inherit;-webkit-appearance:none;border-radius:0}
 <div id="topbar" class="topbar" style="display:none">
   <div class="topbar-row">
     <h1>Store visit scorecard</h1>
-    <button class="user-btn" id="user-btn" onclick="switchUser()"></button>
+    <div style="position:relative">
+      <button class="user-btn" id="user-btn" onclick="toggleUserMenu()"></button>
+      <div id="user-menu" style="display:none;position:absolute;right:0;top:36px;background:#fff;border:1px solid #ddd;border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.1);z-index:200;min-width:180px;overflow:hidden">
+        <button onclick="S.showChangePin=true;toggleUserMenu();render()" style="width:100%;padding:12px 16px;border:none;background:#fff;font-size:14px;text-align:left;border-bottom:1px solid #f0f0f0;font-family:inherit;color:#444">🔒 Change PIN</button>
+        <button onclick="toggleUserMenu();switchUser()" style="width:100%;padding:12px 16px;border:none;background:#fff;font-size:14px;text-align:left;font-family:inherit;color:#A32D2D">↩ Switch user</button>
+      </div>
+    </div>
   </div>
   <p>Rohrman Automotive Group</p>
   <div id="status-bar"></div>
@@ -212,9 +218,10 @@ function esc(s){return(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace
 let S={
   // App mode
   mode:"loading", // loading | pick_user | add_user | app
-  addStep:"name", // name | stores
+  addStep:"name", // name | stores | pin
   addName:"",
   addStores:[],
+  addPin:"",
   // Users
   users:[],
   currentUser:null, // {id, name, stores, can_see_all}
@@ -233,6 +240,12 @@ let S={
   histFilter:"All",
   // Report
   report:null,
+  // PIN
+  pinUser:null, // user selected, awaiting PIN
+  pinInput:"",
+  pinError:"",
+  showChangePin:false,
+  newPin:"",
   // Status
   syncing:false,
   error:null
@@ -255,8 +268,18 @@ async function loadUsers(){
   try{
     const u=await sb("scorecard_users",{query:"select=*&order=created_at.asc"});
     S.users=u||[];
-    const saved=localStorage.getItem("scorecard-current-user");
-    if(saved){const found=S.users.find(x=>x.name===saved);if(found){S.currentUser=found;await loadHistory();S.mode="app";render();return;}}
+    // Check for remembered session (30-day)
+    const saved=localStorage.getItem("scorecard-session");
+    if(saved){
+      try{
+        const sess=JSON.parse(saved);
+        if(sess.name&&sess.ts&&(Date.now()-sess.ts<30*24*60*60*1000)){
+          const found=S.users.find(x=>x.name===sess.name);
+          if(found){S.currentUser=found;await loadHistory();S.mode="app";render();return;}
+        }
+      }catch(e){}
+      localStorage.removeItem("scorecard-session");
+    }
     S.mode="pick_user";
   }catch(err){
     console.error("Load users error:",err);
@@ -270,8 +293,10 @@ async function loadHistory(){
   if(!S.currentUser)return;
   S.syncing=true;S.error=null;render();
   try{
-    const uf=S.currentUser.can_see_all?"":"&user_name=eq."+encodeURIComponent(S.currentUser.name);
-    const visits=await sb("visits",{query:"select=*&order=visited_at.desc&limit=200"+uf});
+    // Filter by stores this user has access to
+    const stores=S.currentUser.stores||ALL_STORES;
+    const storeFilter="&store=in.("+stores.map(s=>'"'+s+'"').join(",")+")";
+    const visits=await sb("visits",{query:"select=*&order=visited_at.desc&limit=200"+storeFilter});
     if(!visits||visits.length===0){S.history=[];S.syncing=false;return;}
     const items=await sb("visit_items",{query:"select=*&visit_id=in.("+visits.map(v=>v.id).join(",")+")"});
     S.history=visits.map(v=>{
@@ -310,22 +335,39 @@ async function delEntry(id){
 }
 
 async function createUser(){
-  if(!S.addName.trim()||S.addStores.length===0)return;
+  if(!S.addName.trim()||S.addStores.length===0||S.addPin.length!==6)return;
   S.syncing=true;render();
   try{
-    const[user]=await sb("scorecard_users",{method:"POST",body:{name:S.addName.trim(),stores:S.addStores,can_see_all:false}});
+    const[user]=await sb("scorecard_users",{method:"POST",body:{name:S.addName.trim(),stores:S.addStores,can_see_all:false,pin:S.addPin}});
     S.users.push(user);
     selectUser(user);
   }catch(err){console.error("Create user error:",err);S.error="Error creating user: "+err.message;S.syncing=false;render();}
 }
 
 // ─── User Actions ───
+function startLogin(u){
+  // If user has no PIN set, go straight in
+  if(!u.pin){selectUser(u);return;}
+  S.pinUser=u;S.pinInput="";S.pinError="";S.mode="enter_pin";render();
+}
+
+function checkPin(){
+  if(S.pinInput===S.pinUser.pin){
+    selectUser(S.pinUser);
+    S.pinUser=null;S.pinInput="";S.pinError="";
+  }else{
+    S.pinError="Incorrect PIN. Try again.";S.pinInput="";render();
+  }
+}
+
 function selectUser(u){
   S.currentUser=u;
-  localStorage.setItem("scorecard-current-user",u.name);
+  // Save 30-day session
+  localStorage.setItem("scorecard-session",JSON.stringify({name:u.name,ts:Date.now()}));
   S.view="score";S.store=null;S.storeConfirmed=false;
   S.scores={};S.comments={};S.photos={};S.notes="";
   S.history=[];S.expanded=null;S.histFilter="All";S.report=null;S.error=null;
+  S.showChangePin=false;S.newPin="";
   S.mode="app";
   loadDraft();
   loadHistory().then(()=>render());
@@ -334,12 +376,30 @@ function selectUser(u){
 
 function switchUser(){
   S.currentUser=null;
-  localStorage.removeItem("scorecard-current-user");
-  S.report=null;S.mode="pick_user";
+  localStorage.removeItem("scorecard-session");
+  S.report=null;S.mode="pick_user";S.showChangePin=false;S.newPin="";
   render();
 }
 
+async function changePin(){
+  if(S.newPin.length!==6||!/^\d{6}$/.test(S.newPin)){S.error="PIN must be exactly 6 digits.";render();return;}
+  S.syncing=true;render();
+  try{
+    await sb("scorecard_users?id=eq."+S.currentUser.id,{method:"PATCH",body:{pin:S.newPin}});
+    S.currentUser.pin=S.newPin;
+    // Update in users array too
+    const u=S.users.find(x=>x.id===S.currentUser.id);if(u)u.pin=S.newPin;
+    S.showChangePin=false;S.newPin="";S.error=null;
+    alert("PIN updated successfully!");
+  }catch(err){console.error("Change PIN error:",err);S.error="Failed to update PIN.";}
+  finally{S.syncing=false;render();}
+}
+
 // ─── Scoring Actions ───
+function toggleUserMenu(){const m=document.getElementById("user-menu");if(m)m.style.display=m.style.display==="none"?"block":"none";}
+// Close menu when clicking elsewhere
+document.addEventListener("click",function(e){const m=document.getElementById("user-menu");const b=document.getElementById("user-btn");if(m&&b&&!b.contains(e.target)&&!m.contains(e.target))m.style.display="none";});
+
 function pickStore(s){S.store=s;S.storeConfirmed=true;saveDraft();render();}
 function changeStore(){S.storeConfirmed=false;render();}
 function doScore(ci,ii,v){const k=ci+"-"+ii;if(S.scores[k]===v){delete S.scores[k];delete S.comments[k];delete S.photos[k];}else{S.scores[k]=v;}saveDraft();render();}
@@ -375,11 +435,11 @@ if(S.mode==="pick_user"){
   h+='<div class="picker-sub">Rohrman Automotive Group</div>';
   h+='<div class="picker-label">Who\'s scoring today?</div>';
   S.users.forEach(u=>{
-    h+='<button class="picker-card" onclick="selectUser(S.users.find(x=>x.id==='+u.id+'))">';
+    h+='<button class="picker-card" onclick="startLogin(S.users.find(x=>x.id==='+u.id+'))">';
     h+='<div><div>'+esc(u.name)+'</div><div class="picker-card-sub">'+(u.stores?u.stores.length:0)+' store'+(u.stores&&u.stores.length!==1?'s':'')+(u.can_see_all?' · Full access':'')+'</div></div>';
     h+='<span style="color:#ccc;font-size:14px">→</span></button>';
   });
-  h+='<button class="picker-add" onclick="S.mode=\'add_user\';S.addStep=\'name\';S.addName=\'\';S.addStores=[];render()"><span style="font-size:20px">+</span> Add new user</button>';
+  h+='<button class="picker-add" onclick="S.mode=\'add_user\';S.addStep=\'name\';S.addName=\'\';S.addStores=[];S.addPin=\'\';render()"><span style="font-size:20px">+</span> Add new user</button>';
   if(S.error)h+='<div style="text-align:center;font-size:12px;color:#A32D2D;margin-top:12px">'+esc(S.error)+'</div>';
   h+='</div></div>';
   app.innerHTML=h;
@@ -391,13 +451,13 @@ if(S.mode==="add_user"){
   tb.style.display="none";
   let h='<div class="picker-screen"><div class="picker-box">';
   h+='<div class="picker-title">New User Setup</div>';
-  h+='<div class="picker-sub">'+(S.addStep==="name"?"Step 1 of 2 — Enter your name":"Step 2 of 2 — Select your stores")+'</div>';
+  h+='<div class="picker-sub">'+(S.addStep==="name"?"Step 1 of 3 — Enter your name":S.addStep==="stores"?"Step 2 of 3 — Select your stores":"Step 3 of 3 — Create your PIN")+'</div>';
 
   if(S.addStep==="name"){
     h+='<input class="add-input" id="add-name-input" type="text" placeholder="Your full name" value="'+esc(S.addName)+'" oninput="S.addName=this.value"/>';
     h+='<button class="add-btn '+(S.addName.trim()?'on':'off')+'" onclick="if(S.addName.trim()){S.addStep=\'stores\';render();}">Continue</button>';
     h+='<button class="back-btn" onclick="S.mode=\'pick_user\';render()">← Back</button>';
-  } else {
+  } else if(S.addStep==="stores"){
     h+='<div style="display:flex;gap:8px;margin-bottom:12px">';
     h+='<button style="flex:1;padding:8px 0;border-radius:8px;border:1px solid #ddd;background:#fff;color:#1B4965;font-size:12px;font-weight:600" onclick="S.addStores=[...ALL_STORES];render()">Select all</button>';
     h+='<button style="flex:1;padding:8px 0;border-radius:8px;border:1px solid #ddd;background:#fff;color:#888;font-size:12px" onclick="S.addStores=[];render()">Clear</button>';
@@ -408,13 +468,35 @@ if(S.mode==="add_user"){
       h+=esc(s)+'<span style="font-size:18px">'+(on?"✓":"")+'</span></button>';
     });
     h+='<div style="height:12px"></div>';
-    h+='<button class="add-btn '+(S.addStores.length>0?'on':'off')+'" onclick="createUser()">'+(S.syncing?'Creating account...':'Start scoring ('+S.addStores.length+' store'+(S.addStores.length!==1?'s':'')+')')+'</button>';
+    h+='<button class="add-btn '+(S.addStores.length>0?'on':'off')+'" onclick="if(S.addStores.length>0){S.addStep=\'pin\';render();}">Continue ('+S.addStores.length+' store'+(S.addStores.length!==1?'s':'')+')</button>';
     h+='<button class="back-btn" onclick="S.addStep=\'name\';render()">← Back</button>';
+  } else if(S.addStep==="pin"){
+    h+='<div style="font-size:14px;color:#555;margin-bottom:16px;text-align:center">Create a 6-digit PIN to secure your account</div>';
+    h+='<input class="add-input" id="add-pin-input" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="Enter 6-digit PIN" value="'+esc(S.addPin)+'" oninput="S.addPin=this.value.replace(/[^0-9]/g,\'\').slice(0,6);this.value=S.addPin;" style="text-align:center;font-size:24px;font-family:DM Mono,monospace;letter-spacing:8px"/>';
+    const pinOk=S.addPin.length===6;
+    h+='<button class="add-btn '+(pinOk?'on':'off')+'" onclick="createUser()">'+(S.syncing?'Creating account...':'Create account')+'</button>';
+    h+='<button class="back-btn" onclick="S.addStep=\'stores\';render()">← Back</button>';
   }
   if(S.error)h+='<div style="text-align:center;font-size:12px;color:#A32D2D;margin-top:12px">'+esc(S.error)+'</div>';
   h+='</div></div>';
   app.innerHTML=h;
   if(S.addStep==="name"){setTimeout(()=>{const inp=document.getElementById("add-name-input");if(inp)inp.focus();},50);}
+  if(S.addStep==="pin"){setTimeout(()=>{const inp=document.getElementById("add-pin-input");if(inp)inp.focus();},50);}
+  return;
+}
+
+// ═══ ENTER PIN ═══
+if(S.mode==="enter_pin"&&S.pinUser){
+  tb.style.display="none";
+  let h='<div class="picker-screen"><div class="picker-box">';
+  h+='<div class="picker-title">'+esc(S.pinUser.name)+'</div>';
+  h+='<div class="picker-sub">Enter your 6-digit PIN</div>';
+  h+='<input class="add-input" id="pin-entry" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="• • • • • •" value="'+esc(S.pinInput)+'" oninput="S.pinInput=this.value.replace(/[^0-9]/g,\'\').slice(0,6);this.value=S.pinInput;if(S.pinInput.length===6)checkPin();" style="text-align:center;font-size:28px;font-family:DM Mono,monospace;letter-spacing:10px"/>';
+  if(S.pinError)h+='<div style="text-align:center;font-size:13px;color:#A32D2D;margin-bottom:12px">'+esc(S.pinError)+'</div>';
+  h+='<button class="back-btn" onclick="S.pinUser=null;S.pinInput=\'\';S.pinError=\'\';S.mode=\'pick_user\';render()">← Back</button>';
+  h+='</div></div>';
+  app.innerHTML=h;
+  setTimeout(()=>{const inp=document.getElementById("pin-entry");if(inp){inp.focus();}},50);
   return;
 }
 
@@ -424,17 +506,18 @@ if(S.report){
   const pe=S.report,pg=getGrade(pe.total,pe.possible),pf=pe.flaggedItems||[],det=pe.details||{},com=pe.comments||{};
   let h='<div class="report-view">';
   h+='<div class="print-bar no-print">';
-  h+='<button onclick="S.report=null;render()" style="border:1px solid #ddd;background:#fff;color:#666">← Back</button>';
+  h+='<button onclick="S.report=null;S.view=\'history\';render()" style="border:1px solid #ddd;background:#fff;color:#666">← Back</button>';
   h+='<button onclick="doPrint()" style="border:none;background:#1B4965;color:#fff">🖨️ Print</button>';
   h+='<button onclick="downloadPDF()" id="pdf-btn" style="border:none;background:#0F6E56;color:#fff">📄 Download PDF</button>';
   h+='</div>';
   h+='<div class="report-header"><div>';
   h+='<h1 style="font-size:18px;font-weight:700">'+esc(pe.store)+' — Visit Report</h1>';
-  h+='<p style="font-size:12px;color:#888;margin-top:4px">'+esc(pe.user_name||"Director")+' — Rohrman Automotive Group | '+fD(pe.date)+'</p>';
+  h+='<p style="font-size:12px;color:#888;margin-top:4px">Rohrman Automotive Group | '+fD(pe.date)+'</p>';
   h+='</div><div style="text-align:right">';
   h+='<div style="font-family:DM Mono,monospace;font-size:26px;font-weight:700">'+pe.total+'/'+pe.possible+'</div>';
   h+='<div style="font-size:12px;color:'+pg.color+';font-weight:600">'+pg.label+'</div>';
   h+='</div></div>';
+  h+='<div style="background:#E6F1FB;border-radius:10px;padding:10px 16px;margin-bottom:16px;display:flex;align-items:center;gap:8px"><span style="font-size:16px">👤</span><span style="font-size:14px;color:#1B4965"><b>Visit completed by:</b> '+esc(pe.user_name||"Unknown")+'</span></div>';
 
   // ─── Follow-up checklist ───
   const pfFail=pf.filter(f=>f.score===0),pfWarn=pf.filter(f=>f.score===1),pfAll=[...pfFail,...pfWarn];
@@ -486,6 +569,22 @@ sb2.innerHTML=stHtml;
 
 let h="";
 const stores=userStores();
+
+// ─── Change PIN Modal ───
+if(S.showChangePin){
+  h+='<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.4);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px" onclick="S.showChangePin=false;S.newPin=\'\';render()">';
+  h+='<div style="background:#fff;border-radius:16px;padding:24px;max-width:340px;width:100%;box-shadow:0 8px 24px rgba(0,0,0,0.15)" onclick="event.stopPropagation()">';
+  h+='<div style="font-size:18px;font-weight:700;margin-bottom:4px">Change PIN</div>';
+  h+='<div style="font-size:13px;color:#888;margin-bottom:16px">Enter a new 6-digit PIN for '+esc(S.currentUser.name)+'</div>';
+  h+='<input id="change-pin-input" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="New 6-digit PIN" value="'+esc(S.newPin)+'" oninput="S.newPin=this.value.replace(/[^0-9]/g,\'\').slice(0,6);this.value=S.newPin;" style="width:100%;padding:14px;border-radius:10px;border:1px solid #ddd;font-size:22px;font-family:DM Mono,monospace;text-align:center;letter-spacing:8px;box-sizing:border-box;margin-bottom:14px"/>';
+  const cpOk=S.newPin.length===6;
+  h+='<button onclick="changePin()" style="width:100%;padding:14px 0;border-radius:10px;border:none;background:'+(cpOk?'#1B4965':'#ccc')+';color:#fff;font-size:15px;font-weight:600;margin-bottom:8px;font-family:inherit;cursor:'+(cpOk?'pointer':'default')+'">'+(S.syncing?'Updating...':'Update PIN')+'</button>';
+  h+='<button onclick="S.showChangePin=false;S.newPin=\'\';render()" style="width:100%;padding:10px 0;border-radius:10px;border:1px solid #ddd;background:#fff;color:#888;font-size:14px;font-family:inherit">Cancel</button>';
+  h+='</div></div>';
+  app.innerHTML=h;
+  setTimeout(()=>{const inp=document.getElementById("change-pin-input");if(inp)inp.focus();},50);
+  return;
+}
 
 // ═══ SCORE VIEW ═══
 if(S.view==="score"){
@@ -678,7 +777,9 @@ async function downloadPDF(){
     doc.setFontSize(18);doc.setFont('helvetica','bold');doc.setTextColor(30);
     doc.text(pe.store+' — Store Visit Report',m,y);y+=20;
     doc.setFontSize(10);doc.setFont('helvetica','normal');doc.setTextColor(120);
-    doc.text((pe.user_name||'Director')+' — Rohrman Automotive Group  |  '+fD(pe.date),m,y);y+=20;
+    doc.text('Rohrman Automotive Group  |  '+fD(pe.date),m,y);y+=16;
+    doc.setFontSize(10);doc.setFont('helvetica','bold');doc.setTextColor(27,73,101);
+    doc.text('Visit completed by: '+(pe.user_name||'Unknown'),m,y);y+=16;
     doc.setDrawColor(27,73,101);doc.setLineWidth(1.5);doc.line(m,y,W-m,y);y+=18;
     doc.setFontSize(22);doc.setFont('helvetica','bold');doc.setTextColor(30);
     doc.text(pe.total+' / '+pe.possible,m,y);
