@@ -158,6 +158,32 @@ input,textarea{font-family:inherit;-webkit-appearance:none;border-radius:0}
 .empty{text-align:center;padding:60px 20px;color:#999}
 .empty p:first-child{font-size:16px;font-weight:500;margin-bottom:6px}
 .empty p:last-child{font-size:14px}
+
+.draft-banner{background:#FFF9E6;border:1px solid #EAD474;border-radius:12px;padding:14px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.draft-banner .draft-info{flex:1}
+.draft-banner .draft-label{font-size:13px;font-weight:600;color:#7A6520}
+.draft-banner .draft-meta{font-size:11px;color:#A89445;margin-top:2px}
+.draft-actions{display:flex;gap:8px;margin-top:10px}
+.btn-save-draft{flex:1;padding:14px 0;border-radius:12px;border:2px solid #1B4965;background:#fff;color:#1B4965;font-size:15px;font-weight:600;min-height:52px;display:flex;align-items:center;justify-content:center;gap:8px}
+.btn-save-draft:active{background:#E6F1FB}
+.btn-save-draft.saving{border-color:#888;color:#888;cursor:default}
+.btn-finalize{flex:1;padding:14px 0;border-radius:12px;border:none;color:#fff;font-size:15px;font-weight:600;min-height:52px}
+.btn-finalize.on{background:#1B4965}
+.btn-finalize.off{background:#ccc;cursor:default}
+.btn-finalize.syncing{background:#888;cursor:default}
+.btn-finalize:active.on{background:#15384F}
+.draft-card{border:1px solid #EAD474;border-radius:12px;padding:14px 16px;margin-bottom:10px;background:#FFFDF3}
+.draft-card-top{display:flex;justify-content:space-between;align-items:center}
+.draft-card .store-name{font-weight:600;font-size:16px;color:#1a1a1a}
+.draft-card .draft-date{font-size:12px;color:#A89445;margin-top:2px}
+.draft-card .draft-progress{font-family:'DM Mono',monospace;font-size:15px;font-weight:600;color:#7A6520}
+.draft-card-actions{display:flex;gap:8px;margin-top:10px}
+.draft-card-actions button{padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;min-height:36px;font-family:inherit}
+.btn-resume{border:none;background:#1B4965;color:#fff}
+.btn-resume:active{background:#15384F}
+.btn-discard{border:1px solid #ddd;background:#fff;color:#999}
+.draft-saved-toast{position:fixed;bottom:100px;left:50%;transform:translateX(-50%);background:#1B4965;color:#fff;padding:12px 24px;border-radius:10px;font-size:14px;font-weight:600;z-index:500;box-shadow:0 4px 16px rgba(0,0,0,0.2);animation:toastIn 0.3s ease}
+@keyframes toastIn{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
 </style>
 </head>
 <body>
@@ -249,7 +275,12 @@ let S={
   newPin:"",
   // Status
   syncing:false,
-  error:null
+  error:null,
+  // Drafts
+  cloudDrafts:[], // drafts from Supabase
+  draftId:null, // current draft id if resuming
+  draftSaving:false,
+  draftLastSaved:null
 };
 
 function userStores(){return S.currentUser?S.currentUser.stores||ALL_STORES:ALL_STORES;}
@@ -286,7 +317,99 @@ function saveDraft(){const dk=draftKey();if(!dk)return;if(S.store||Object.keys(S
   localStorage.setItem(dk,JSON.stringify({scores:S.scores,comments:S.comments,photos:S.photos,notes:S.notes,store:S.store}));
 }}
 function loadDraft(){const dk=draftKey();if(!dk)return;try{const dr=JSON.parse(localStorage.getItem(dk));if(dr){S.scores=dr.scores||{};S.comments=dr.comments||{};S.photos=dr.photos||{};S.notes=dr.notes||"";if(dr.store){S.store=dr.store;S.storeConfirmed=true;}}}catch(e){}}
-function clearDraft(){S.scores={};S.comments={};S.photos={};S.notes="";S.store=null;S.storeConfirmed=false;const dk=draftKey();if(dk)localStorage.removeItem(dk);}
+function clearDraft(){S.scores={};S.comments={};S.photos={};S.notes="";S.store=null;S.storeConfirmed=false;S.draftId=null;S.draftLastSaved=null;const dk=draftKey();if(dk)localStorage.removeItem(dk);}
+
+// ─── Cloud Draft Operations ───
+async function loadCloudDrafts(){
+  if(!S.currentUser)return;
+  try{
+    const drafts=await sb("visit_drafts",{query:"select=*&user_name=eq."+encodeURIComponent(S.currentUser.name)+"&order=updated_at.desc"});
+    S.cloudDrafts=drafts||[];
+  }catch(err){console.error("Load drafts error:",err);S.cloudDrafts=[];}
+}
+
+async function saveDraftCloud(){
+  if(!S.currentUser||!S.store)return;
+  if(Object.keys(S.scores).length===0){S.error="Score at least one item before saving a draft.";render();return;}
+  S.draftSaving=true;render();
+  try{
+    const payload={
+      user_name:S.currentUser.name,
+      store:S.store,
+      scores:S.scores,
+      comments:S.comments,
+      photos:S.photos,
+      notes:S.notes,
+      updated_at:new Date().toISOString()
+    };
+    if(S.draftId){
+      // Update existing draft
+      const[updated]=await sb("visit_drafts?id=eq."+S.draftId,{method:"PATCH",body:payload});
+      S.draftLastSaved=new Date();
+    }else{
+      // Create new draft
+      const[created]=await sb("visit_drafts",{method:"POST",body:payload});
+      S.draftId=created.id;
+      S.draftLastSaved=new Date();
+    }
+    // Also save locally as backup
+    saveDraft();
+    // Show toast
+    showToast("Draft saved to cloud ☁️");
+    // Refresh drafts list
+    await loadCloudDrafts();
+  }catch(err){console.error("Save draft error:",err);S.error="Failed to save draft. "+err.message;}
+  finally{S.draftSaving=false;render();}
+}
+
+async function resumeDraft(draft){
+  S.store=draft.store;
+  S.storeConfirmed=true;
+  S.scores=draft.scores||{};
+  S.comments=draft.comments||{};
+  S.photos=draft.photos||{};
+  S.notes=draft.notes||"";
+  S.draftId=draft.id;
+  S.draftLastSaved=new Date(draft.updated_at);
+  saveDraft(); // save to localStorage too
+  S.view="score";
+  render();
+}
+
+async function discardDraft(draftId){
+  S.syncing=true;render();
+  try{
+    await sb("visit_drafts?id=eq."+draftId,{method:"DELETE"});
+    S.cloudDrafts=S.cloudDrafts.filter(d=>d.id!==draftId);
+    if(S.draftId===draftId){S.draftId=null;S.draftLastSaved=null;}
+  }catch(err){console.error("Discard draft error:",err);S.error="Failed to discard draft.";}
+  finally{S.syncing=false;render();}
+}
+
+async function deleteCloudDraft(){
+  if(!S.draftId)return;
+  try{await sb("visit_drafts?id=eq."+S.draftId,{method:"DELETE"});}catch(err){console.error("Delete draft error:",err);}
+  S.draftId=null;S.draftLastSaved=null;
+}
+
+function showToast(msg){
+  const existing=document.querySelector('.draft-saved-toast');if(existing)existing.remove();
+  const el=document.createElement('div');el.className='draft-saved-toast';el.textContent=msg;
+  document.body.appendChild(el);setTimeout(()=>{el.style.opacity='0';el.style.transition='opacity 0.3s';setTimeout(()=>el.remove(),300);},2500);
+}
+
+function draftProgress(draft){
+  const scored=Object.keys(draft.scores||{}).length;
+  return scored+'/'+TOTAL_POSSIBLE/2+' items scored';
+}
+
+function timeSince(date){
+  const d=new Date(date),now=new Date(),diff=now-d;
+  if(diff<60000)return'just now';
+  if(diff<3600000)return Math.floor(diff/60000)+'m ago';
+  if(diff<86400000)return Math.floor(diff/3600000)+'h ago';
+  return fD(date);
+}
 
 function lastVisitForUser(storeName){return S.history.filter(h=>h.user_name===S.currentUser.name).find(h=>h.store===storeName);}
 function storeHist(storeName){return S.history.filter(h=>h.store===storeName);}
@@ -303,7 +426,7 @@ async function loadUsers(){
         const sess=JSON.parse(saved);
         if(sess.name&&sess.ts&&(Date.now()-sess.ts<30*24*60*60*1000)){
           const found=S.users.find(x=>x.name===sess.name);
-          if(found){S.currentUser=found;await loadHistory();S.mode="app";render();return;}
+          if(found){S.currentUser=found;await loadHistory();await loadCloudDrafts();S.mode="app";render();return;}
         }
       }catch(e){}
       localStorage.removeItem("scorecard-session");
@@ -346,8 +469,10 @@ async function submitVisit(){
     const rows=[];
     Object.entries(S.scores).forEach(([k,v])=>{const[ci,ii]=k.split("-").map(Number);rows.push({visit_id:visit.id,category_index:ci,item_index:ii,category_name:CATEGORIES[ci].name,item_text:CATEGORIES[ci].items[ii],score:v,comment:S.comments[k]||"",photos:S.photos[k]||[]});});
     if(rows.length>0)await sb("visit_items",{method:"POST",body:rows});
+    await deleteCloudDraft();
     clearDraft();
     await loadHistory();
+    await loadCloudDrafts();
     // Auto-open the report for the visit we just saved
     const justSaved=S.history.find(e=>e.id===visit.id);
     if(justSaved){S.report=justSaved;}else{S.view="history";}
@@ -399,7 +524,7 @@ function selectUser(u){
   S.showChangePin=false;S.newPin="";
   S.mode="app";
   loadDraft();
-  loadHistory().then(()=>render());
+  Promise.all([loadHistory(),loadCloudDrafts()]).then(()=>render());
   render();
 }
 
@@ -429,8 +554,16 @@ function toggleUserMenu(){const m=document.getElementById("user-menu");if(m)m.st
 // Close menu when clicking elsewhere
 document.addEventListener("click",function(e){const m=document.getElementById("user-menu");const b=document.getElementById("user-btn");if(m&&b&&!b.contains(e.target)&&!m.contains(e.target))m.style.display="none";});
 
-function pickStore(s){S.store=s;S.storeConfirmed=true;saveDraft();render();}
-function changeStore(){S.storeConfirmed=false;render();}
+function pickStore(s){
+  // Check if there's a cloud draft for this store
+  const existingDraft=S.cloudDrafts.find(d=>d.store===s&&d.user_name===S.currentUser.name);
+  if(existingDraft){
+    resumeDraft(existingDraft);
+    return;
+  }
+  S.store=s;S.storeConfirmed=true;S.draftId=null;S.draftLastSaved=null;saveDraft();render();
+}
+function changeStore(){S.storeConfirmed=false;S.draftId=null;S.draftLastSaved=null;render();}
 function doScore(ci,ii,v){const k=ci+"-"+ii;if(S.scores[k]===v){delete S.scores[k];delete S.comments[k];delete S.photos[k];}else{S.scores[k]=v;}saveDraft();render();}
 function addPhoto(key){
   const inp=document.createElement("input");inp.type="file";inp.accept="image/*";inp.capture="environment";
@@ -652,6 +785,29 @@ if(S.view==="score"){
     h+='<div style="padding:30px 0;text-align:center">';
     h+='<div style="font-size:20px;font-weight:700;margin-bottom:6px">Which store are you visiting?</div>';
     h+='<p style="font-size:14px;color:#888;margin-bottom:24px">Select a store to begin your inspection</p>';
+
+    // Show cloud drafts if any
+    const myDrafts=S.cloudDrafts.filter(d=>d.user_name===S.currentUser.name);
+    if(myDrafts.length>0){
+      h+='<div style="max-width:320px;margin:0 auto 24px;text-align:left">';
+      h+='<div style="font-size:14px;font-weight:600;color:#7A6520;margin-bottom:10px;display:flex;align-items:center;gap:6px">☁️ In-progress drafts</div>';
+      myDrafts.forEach(d=>{
+        const scored=Object.keys(d.scores||{}).length;
+        const totalItems=CATEGORIES.reduce((s,c)=>s+c.items.length,0);
+        const pctDone=Math.round(scored/totalItems*100);
+        h+='<div class="draft-card">';
+        h+='<div class="draft-card-top"><div><div class="store-name">'+esc(d.store)+'</div>';
+        h+='<div class="draft-date">Saved '+timeSince(d.updated_at)+' · '+scored+'/'+totalItems+' items ('+pctDone+'%)</div>';
+        h+='</div><div class="draft-progress">'+pctDone+'%</div></div>';
+        h+='<div class="draft-card-actions">';
+        h+='<button class="btn-resume" onclick="resumeDraft(S.cloudDrafts.find(x=>x.id==='+d.id+'))">Resume</button>';
+        h+='<button class="btn-discard" onclick="if(confirm(\'Discard this draft?\')){discardDraft('+d.id+')}">Discard</button>';
+        h+='</div></div>';
+      });
+      h+='</div>';
+      h+='<div style="max-width:320px;margin:0 auto 16px;border-top:1px solid #e8e8e8;padding-top:16px"><div style="font-size:14px;font-weight:600;color:#555;margin-bottom:10px">Or start a new visit</div></div>';
+    }
+
     h+='<div style="display:flex;flex-direction:column;gap:10px;max-width:320px;margin:0 auto">';
     stores.forEach(s=>{
       h+='<button onclick="pickStore(\''+s.replace(/'/g,"\\'")+'\')" style="padding:16px 20px;border-radius:12px;border:1px solid #ddd;background:#fff;font-size:16px;font-weight:500;color:#1a1a1a;text-align:left;min-height:52px;display:flex;align-items:center;justify-content:space-between">';
@@ -715,8 +871,19 @@ if(S.view==="score"){
     h+='</div>';
     if(fc+wc>0)h+='<div style="font-size:12px;color:#A32D2D;margin-top:4px">'+fc+' failing, '+wc+' needs work</div>';
     h+='</div><div class="score-num">'+totalScore+'/'+TOTAL_POSSIBLE+'</div></div>';
-    const btnClass=S.syncing?'syncing':totalScore>0?'on':'off';
-    h+='<button class="submit-btn '+btnClass+'" '+(totalScore>0&&!S.syncing?'onclick="submitVisit()"':'disabled')+'>'+(S.syncing?'Saving to Supabase...':'Save visit score')+'</button>';
+
+    // Draft status banner
+    if(S.draftId&&S.draftLastSaved){
+      h+='<div class="draft-banner"><div class="draft-info"><div class="draft-label">☁️ Draft saved to cloud</div><div class="draft-meta">Last saved '+timeSince(S.draftLastSaved)+'</div></div></div>';
+    }
+
+    // Action buttons — save draft + finalize
+    h+='<div class="draft-actions" style="margin-bottom:60px">';
+    const draftBtnClass=S.draftSaving?'btn-save-draft saving':'btn-save-draft';
+    h+='<button class="'+draftBtnClass+'" '+(Object.keys(S.scores).length>0&&!S.draftSaving?'onclick="saveDraftCloud()"':'disabled')+'>'+(S.draftSaving?'Saving...':'☁️ Save Draft')+'</button>';
+    const btnClass=S.syncing?'btn-finalize syncing':totalScore>0?'btn-finalize on':'btn-finalize off';
+    h+='<button class="'+btnClass+'" '+(totalScore>0&&!S.syncing?'onclick="submitVisit()"':'disabled')+'>'+(S.syncing?'Saving...':'✓ Finalize')+'</button>';
+    h+='</div>';
   }
 }
 
